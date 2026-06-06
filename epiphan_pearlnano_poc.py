@@ -81,7 +81,7 @@ def get_auth(target, password=DEFAULT_PASSWORD):
 
 
 def req(target, path, auth=None, method="GET", **kwargs):
-    url = f"https://{target}{path}"
+    url = f"http://{target}{path}"
     kwargs.setdefault("timeout", 10)
     kwargs.setdefault("verify", False)
     if auth:
